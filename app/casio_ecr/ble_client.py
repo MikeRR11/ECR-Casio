@@ -42,6 +42,11 @@ class CasioBusyError(CasioProtocolError):
     """Register already has another BLE client connected."""
 
 
+class CasioDisconnectedError(CasioProtocolError):
+    """The register dropped the BLE link mid-operation (it does this while
+    printing a physical report; reconnect and keep waiting)."""
+
+
 class CasioLimitedByLawError(CasioProtocolError):
     """Register refused per BLE_PACKET_TYPE_COMMUNICATION_END payload[0]==1."""
 
@@ -60,19 +65,83 @@ async def scan_for_register(timeout: float = 10.0) -> list[BLEDevice]:
 
 
 class CasioBleClient:
-    def __init__(self, address: str) -> None:
+    def __init__(self, address: str, prefer_power_optimized: bool = False) -> None:
         self.address = address
         self._client: BleakClient | None = None
         self._rx = _RxState()
+        self._disconnected = False
+        self._prefer_power_optimized = prefer_power_optimized
+        self._conn_param_request = None  # hold the WinRT request object alive
+
+    def _apply_power_optimized(self) -> None:
+        """Ask Windows for the PowerOptimized BLE connection parameters (longest
+        LinkTimeout preset + a slower connection interval). bleak doesn't expose
+        this; we reach the WinRT BluetoothLEDevice bleak connected with and hold
+        the returned request object so the preference stays active. Best-effort:
+        the register (peripheral) may impose its own params."""
+        try:
+            from winrt.windows.devices.bluetooth import BluetoothLEPreferredConnectionParameters as P
+            dev = getattr(self._client._backend, "_requester", None)  # type: ignore[union-attr]
+            if dev is None:
+                log.warning("PowerOptimized: no WinRT device handle available on this bleak backend")
+                return
+            self._conn_param_request = dev.request_preferred_connection_parameters(P.power_optimized)
+            log.info(
+                "PowerOptimized conn params requested (link_timeout=%s, interval=%s-%s)",
+                P.power_optimized.link_timeout,
+                P.power_optimized.min_connection_interval,
+                P.power_optimized.max_connection_interval,
+            )
+        except Exception as e:  # noqa: BLE001 - purely a best-effort optimization
+            log.warning("PowerOptimized request failed (continuing without it): %s", e)
+
+    def _on_disconnect(self, _client) -> None:
+        log.info("BLE link dropped by register/stack")
+        self._disconnected = True
+        # Wake any _wait_packet() caller so it can notice the drop.
+        self._rx.event.set()
 
     async def connect(self) -> None:
         log.info("Connecting to %s", self.address)
-        self._client = BleakClient(self.address)
+        self._disconnected = False
+        self._client = BleakClient(self.address, disconnected_callback=self._on_disconnect)
         await self._client.connect()
+        if self._prefer_power_optimized:
+            self._apply_power_optimized()
         await self._client.start_notify(CHARACTERISTIC_UUID, self._on_notify)
         log.info("Connected, notifications enabled")
 
+    async def reconnect_until(self, deadline: float, retry_gap: float = 2.0) -> bool:
+        """Keep trying to reconnect until `deadline` (time.monotonic-based).
+
+        Used when the register drops the link while printing a report: it
+        stops advertising during the print, then its BT module comes back.
+        Returns True once reconnected, False if the deadline passed.
+        """
+        try:
+            if self._client:
+                await self._client.disconnect()
+        except Exception:
+            pass
+        self._client = None
+        attempt = 0
+        while time.monotonic() < deadline:
+            attempt += 1
+            try:
+                self._rx.reassembler = framing.PacketReassembler()  # fresh link, fresh framing
+                await self.connect()
+                log.info("Reconnected on attempt %d", attempt)
+                return True
+            except Exception as e:  # noqa: BLE001 - device likely not advertising yet
+                log.debug("reconnect attempt %d failed: %s", attempt, e)
+                self._client = None
+                await asyncio.sleep(retry_gap)
+        return False
+
     async def disconnect(self) -> None:
+        if self._disconnected:
+            self._client = None
+            return
         if self._client and self._client.is_connected:
             try:
                 await self._write(framing.build_base_packet(framing.STX))
@@ -126,6 +195,8 @@ class CasioBleClient:
         while True:
             if self._rx.packets:
                 return self._rx.packets.pop(0)
+            if self._disconnected:
+                raise CasioDisconnectedError("BLE link dropped while waiting for a packet")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise CasioTimeoutError("timed out waiting for register response")
@@ -299,3 +370,161 @@ class CasioBleClient:
         if result != "00":
             raise CasioProtocolError(f"XZ start failed, result code {result!r}")
         return result
+
+    async def receive_xz_report(
+        self,
+        report_type: str = "X",
+        remote_file: str = jobs.FILENO_REMOTE_DAILY,
+        overall_timeout: float = 900.0,
+        idle_gap: float = 6.0,
+        before_timeout: float = 600.0,
+        datetime_first: bool = False,  # deprecated: see NOTE below (replay bug)
+    ) -> bytes:
+        """Trigger an X/Z report AND receive the full sales-data file streamed
+        back (the "detalle de movimientos": per-dept/PLU/hourly/EJ/totalizers).
+
+        Flow (docs/protocol addendum section 1.3): job 0013 trigger -> the
+        register initiates its own transfer (phases 9004/9005/9006). We stay on
+        the SAME connection for the whole exchange (this is one logical
+        transaction, not the "two jobs on one connection" replay bug), grant
+        CTS to pace the register's streaming, and accumulate every data payload
+        until the register signals ETX/EOT or goes idle.
+
+        SAFETY:
+        - `report_type="X"` is READ-ONLY: it reads totals without clearing them.
+          Prefer X for all investigation.
+        - `report_type="Z"` READS AND RESETS the register's totals (closes the
+          day). Only pass Z when a real day-close is intended.
+        - Never sends an unsolicited trailing ETX (implicated in the past
+          firmware hang); it only ACKs a register-sent ETX.
+
+        Returns the raw FileAll bytes (framing stripped; parse with
+        `protocol.salesfile.parse_sales_file_auto`). This method is
+        deliberately tolerant/adaptive and logs every packet so a first live
+        run captures diagnostics even if the exact pacing needs tuning.
+        """
+        report_type = report_type.upper()
+        self._rx.packets.clear()
+
+        # NOTE: the original app pushes date/time (job 0001) before a DAILY
+        # remote report (spec 3.1c). Doing that in THIS connection triggers the
+        # known replay bug (register repeats the previous job's empty answer,
+        # observed live 2026-07-18: trigger result came back '??'). If wanted,
+        # do the datetime push in its OWN connection before calling this
+        # method (pull_report.py does exactly that); datetime_first here must
+        # stay False-equivalent and is kept only for API compatibility.
+
+        # -- Phase 1: 0013 trigger, proven simple-job shape (STX -> wait -> job) --
+        # Generous post-STX wait: a freshly-woken BT module took 5.4s to send
+        # its first CTS (observed live), blowing the default 5s budget.
+        await self._write(framing.build_base_packet(framing.STX))
+        first = await self._wait_packet(15.0)
+        self._check_error(first)
+        log.debug("post-STX response: type=0x%02X", first.type_byte)
+        await self._write(jobs.xz_start_packet(report_type, remote_file))
+
+        trigger = bytearray()
+        deadline = time.monotonic() + DEFAULT_JOB_TIMEOUT
+        while True:
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0:
+                break
+            pkt = await self._wait_packet(remaining)
+            self._check_error(pkt)
+            if pkt.type_byte in self._CONTROL_TYPES:
+                continue
+            trigger += pkt.payload
+            if pkt.text in (framing.TEXT_SINGLE_CHUNK, framing.TEXT_END):
+                break
+        code = responses.parse_xz_result(trigger) if trigger else "??"
+        log.info("XZ trigger result code: %r (report_type=%s file=%s)", code, report_type, remote_file)
+        if code != "00":
+            raise CasioProtocolError(f"XZ start failed, result code {code!r}")
+
+        # Close OUR trigger transaction with ETX. The decompiled app's state
+        # table sends writeEndTrans() at dealno 3 for job 0013 (addendum
+        # section 1.3), and without it the register waits ~13s after its "00"
+        # ack, emits modem-mode garbage ("+++A") and closes the GATT session
+        # (observed live 2026-07-18) -- it needs the trigger transaction closed
+        # before it opens its own data-transfer transaction (startmode=2 in
+        # the app = same connection, no reconnect). NOTE: this ETX is specific
+        # to the XZ flow; simple jobs must still NOT send a trailing ETX.
+        await self._write(framing.build_base_packet(framing.ETX))
+        log.info("XZ: trigger transaction closed with ETX, waiting for register STX")
+
+        # -- Phase 9004: wait for the register to OPEN its own data transfer --
+        # The register initiates by sending STX; we must NOT send anything yet.
+        # (Sending a premature CTS on this reused link just makes the register
+        # replay its trigger-ack 0xF5/0x00 -- observed live 2026-07-18 as a
+        # stream of single 0x00 bytes.) CRITICAL: the register PRINTS the full
+        # paper report FIRST and only then streams -- the original app budgets
+        # 72000 x 50ms (~60 min!) for this phase (addendum section 1.1), and
+        # giving up early + disconnecting makes the register fail with
+        # "Bluetooth Fin Error 5900" / screen "E220 Disp. Bluetooth no
+        # conectado" when it finally tries to send (observed live 2026-07-18).
+        # If the register never opens a transfer at all, check that
+        # "X data -> mobile" / "Z data -> mobile" is YES on the register
+        # (PGM -> [Bluetooth] -> Functions), else it only prints.
+        payload = bytearray()
+        overall_deadline = time.monotonic() + overall_timeout
+        before_deadline = time.monotonic() + before_timeout
+        started = False
+        while time.monotonic() < before_deadline:
+            try:
+                pkt = await self._wait_packet(min(2.0, before_deadline - time.monotonic()))
+            except CasioTimeoutError:
+                continue
+            except CasioDisconnectedError:
+                # EXPECTED mid-flow: the register drops the BLE link while it
+                # prints the paper report (module resets, stops advertising),
+                # then comes back and STREAMS on a fresh connection. Keep
+                # reconnecting until it reappears, then resume waiting for its
+                # STX. (Observed live 2026-07-18; matches the app tolerating
+                # status-133 disconnects with "BleScan ReStart".)
+                log.info("XZ receive: register dropped the link (printing) -- reconnecting...")
+                if not await self.reconnect_until(before_deadline):
+                    log.warning("XZ receive: could not reconnect before deadline")
+                    break
+                continue
+            self._check_error(pkt)
+            if pkt.type_byte == framing.STX:
+                started = True
+                log.info("XZ receive: register opened its data transfer (STX)")
+                break
+            log.debug("XZ receive: waiting for register STX, ignoring 0x%02X", pkt.type_byte)
+        if not started:
+            log.warning(
+                "XZ receive: register never opened a data transfer (no STX in %.0fs). "
+                "The report ran (result 00) but was NOT streamed -- enable "
+                "'X data -> mobile' / 'Z data -> mobile' on the register "
+                "(PGM -> [Bluetooth] -> Functions). 0 bytes.",
+                before_timeout,
+            )
+            return b""
+
+        # -- Phase 9005: CTS-paced receive until the register closes with ETX/EOT --
+        await self._write(framing.build_base_packet(framing.CTS))
+        while time.monotonic() < overall_deadline:
+            try:
+                pkt = await self._wait_packet(idle_gap)
+            except CasioTimeoutError:
+                log.info("XZ receive: idle gap elapsed, assuming transfer complete (%d bytes)", len(payload))
+                break
+            except CasioDisconnectedError:
+                log.warning("XZ receive: link dropped mid-transfer, keeping %d partial bytes", len(payload))
+                break
+            self._check_error(pkt)
+            t = pkt.type_byte
+            if t == framing.STX:
+                await self._write(framing.build_base_packet(framing.CTS))
+                continue
+            if t in (framing.ETX, framing.EOT):
+                log.info("XZ receive: register sent 0x%02X (end), %d bytes total", t, len(payload))
+                await self._write(framing.build_base_packet(framing.ACK))
+                break
+            if t in self._CONTROL_TYPES:
+                continue
+            payload += pkt.payload
+            log.debug("XZ receive: +%d bytes (total %d, text=0x%02X)", len(pkt.payload), len(payload), pkt.text)
+            await self._write(framing.build_base_packet(framing.CTS))
+        return bytes(payload)

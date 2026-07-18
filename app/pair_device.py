@@ -30,7 +30,7 @@ def addr_to_int(addr: str) -> int:
 PIN_FILE = os.path.join(os.path.dirname(__file__), ".pairing_pin.txt")
 
 
-def wait_for_pin_file(timeout: float = 25.0) -> str | None:
+def wait_for_pin_file(timeout: float = 180.0) -> str | None:
     """Poll PIN_FILE for a code written by a separate process/chat turn."""
     if os.path.exists(PIN_FILE):
         os.remove(PIN_FILE)
@@ -60,6 +60,22 @@ async def main(address: str) -> None:
     print(f"Device name: {device.name!r}")
     print(f"Currently paired: {pairing.is_paired}")
     print(f"Can pair: {pairing.can_pair}")
+
+    # If Windows still holds a stale bond (e.g. after the register's backup
+    # batteries were pulled, it forgets bonding but Windows doesn't), a fresh
+    # pair is refused with AlreadyPaired. Clear it first, then re-resolve.
+    if pairing.is_paired:
+        print("Removing stale Windows bond before re-pairing...")
+        unpair_result = await pairing.unpair_async()
+        print(f"  unpair status: {unpair_result.status}")
+        device = await BluetoothLEDevice.from_bluetooth_address_async(addr_int)
+        if device is None:
+            print("Device stopped advertising after unpair. Put it back into pairing")
+            print("mode and re-run.")
+            return
+        info = device.device_information
+        pairing = info.pairing
+        print(f"  now paired: {pairing.is_paired} / can pair: {pairing.can_pair}")
 
     custom = pairing.custom
 

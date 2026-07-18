@@ -1,0 +1,31 @@
+INFO:     Started server process [35336]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8770 (Press CTRL+C to quit)
+INFO:     127.0.0.1:61543 - "POST /api/pull HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61544 - "GET /api/reports/daily HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50214 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50214 - "GET /api/config HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50214 - "GET /favicon.ico HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:57024 - "GET /api/latest HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64042 - "GET /api/snapshots?limit=100 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64282 - "GET /api/reports/daily HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52691 - "GET /api/reports/monthly HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65176 - "GET /api/latest HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65177 - "GET /api/snapshots?limit=5 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65191 - "GET /api/reports/monthly HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65192 - "GET /api/config HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60661 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60662 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58484 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58484 - "GET /api/config HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58484 - "GET /api/latest HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62728 - "GET /api/snapshots?limit=100 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52113 - "GET /favicon.ico HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:58484 - "GET /api/reports/daily HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49916 - "GET /api/reports/monthly HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61794 - "POST /api/pull HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60665 - "GET /api/snapshots?limit=100 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61794 - "GET /api/latest HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56176 - "GET /api/reports/monthly HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53810 - "GET /api/reports/daily HTTP/1.1" 200 OK
