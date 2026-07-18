@@ -1,0 +1,14 @@
+Resolving BluetoothLEDevice for 08:00:74:57:30:EF (0x0800745730EF)...
+Device name: 'EY240139106940'
+Currently paired: False
+Can pair: True
+
+Requesting pairing (protection level: Encryption)...
+
+*** PairingRequested event: kind=4 ***
+    Register wants US to supply the PIN it's showing on its screen.
+    Waiting up to 25s for PIN to be written to D:\MIKE_GIT\ECR Casio\app\.pairing_pin.txt ...
+    -> accepted with pin='011173'
+
+Pairing result status: 0
+SUCCESS: device is now paired.
